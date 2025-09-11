@@ -72,7 +72,7 @@ jobs:
             api_response=$(curl -s -w "\n%{http_code}" \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/kurisaW/pulls/$PR_NUMBER/files")
+              "https://api.github.com/repos/kurisaW/${{ github.repository }}/pulls/$PR_NUMBER/files")
             
             # 分离HTTP状态码和响应内容
             http_status=$(echo "$api_response" | tail -1)

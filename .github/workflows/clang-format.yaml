@@ -11,8 +11,6 @@ on:
         description: "要格式化的分支 | Branch to format"
         required: true
         default: ''
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
@@ -23,20 +21,19 @@ jobs:
     if: |
       github.repository_owner != 'kurisaW'
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.ref }}
+          ref: ${{ github.event.inputs.branch }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+          # 添加这行确保使用LF行尾符
           lfs: false
 
-      - name: Install clang-format and jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format jq
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
 
       - name: Check clang-format version
         run: |
@@ -44,91 +41,76 @@ jobs:
           clang-format --version
           echo "📋 Detailed version info:"
           clang-format -version
+          # 检查支持的功能
+          echo "📋 Checking supported features..."
+          clang-format --help | grep -i "align\|consecutive" || echo "No align/consecutive options found"
 
-      - name: Extract PR number if triggered by PR
-        id: extract-pr
-        if: github.event_name == 'pull_request'
+      - name: Get changed files from PR
+        id: get-pr-files
         run: |
-          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-          echo "Extracted PR number: ${{ github.event.pull_request.number }}"
-
-      - name: Get changed files
-        id: get-changed-files
-        run: |
-          # 如果是PR触发，使用GitHub API获取变更文件
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "Fetching changed files for PR #${{ steps.extract-pr.outputs.PR_NUMBER }}..."
+          max_retries=3
+          retry_count=0
+          changed_files=""
+          api_response=""
+          
+          echo "Fetching changed files for PR #${{ github.event.pull_request.number }}..."
+          
+          while [ $retry_count -lt $max_retries ]; do
+            api_response=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files")
             
-            max_retries=3
-            retry_count=0
-            changed_files=""
-            api_response=""
-            
-            while [ $retry_count -lt $max_retries ]; do
-              api_response=$(curl -s \
-                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.extract-pr.outputs.PR_NUMBER }}/files")
-              
-              # 验证响应是否为有效JSON且包含文件数组
-              if jq -e 'if type=="array" then .[0].filename else empty end' <<<"$api_response" >/dev/null 2>&1; then
-                changed_files=$(jq -r '.[].filename' <<<"$api_response")
-                break
-              else
-                echo "Retry $((retry_count+1)): API response not ready or invalid format"
-                sleep 5
-                ((retry_count++))
-              fi
-            done
-            
-            if [ -z "$changed_files" ]; then
-              echo "Error: Failed to get changed files after $max_retries attempts"
-              echo "Final API Response: $api_response"
-              exit 1
+            # 验证响应是否为有效JSON且包含文件数组
+            if jq -e 'if type=="array" then .[0].filename else empty end' <<<"$api_response" >/dev/null 2>&1; then
+              changed_files=$(jq -r '.[].filename' <<<"$api_response")
+              break
+            else
+              echo "Retry $((retry_count+1)): API response not ready or invalid format"
+              sleep 5
+              ((retry_count++))
             fi
-            
-            echo "$changed_files" > changed_files.txt
-            echo "Successfully fetched $(wc -l < changed_files.txt) changed files from PR"
-            
-          else
-            # 如果是手动触发，使用git diff获取变更
-            echo "Using git diff to get changed files..."
-            git diff --name-only HEAD^ HEAD > changed_files.txt
-            echo "Found $(wc -l < changed_files.txt) changed files via git diff"
+          done
+          
+          if [ -z "$changed_files" ]; then
+            echo "Error: Failed to get changed files after $max_retries attempts"
+            echo "Final API Response: $api_response"
+            exit 1
           fi
           
-          # 读取文件列表
-          CHANGED_FILES=$(cat changed_files.txt | tr '\n' ',' | sed 's/,$//')
-          echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
-          echo "files_count=$(wc -l < changed_files.txt)" >> $GITHUB_OUTPUT
+          # 将文件列表转换为逗号分隔格式
+          changed_files_comma=$(echo "$changed_files" | tr '\n' ',')
+          changed_files_comma=${changed_files_comma%,}  # 移除最后一个逗号
+          
+          echo "Successfully fetched $(echo "$changed_files" | wc -l) changed files"
+          
+          # 设置输出
+          echo "all_changed_files=$changed_files_comma" >> $GITHUB_OUTPUT
+          echo "changed_files_count=$(echo "$changed_files" | wc -l)" >> $GITHUB_OUTPUT
 
       - name: Find source files to format
         id: find-files
         run: |
-          # 获取修改的文件
-          CHANGED_FILES="${{ steps.get-changed-files.outputs.changed_files }}"
-          echo "修改的文件: $CHANGED_FILES"
+          # 获取PR中修改的文件
+          CHANGED_FILES="${{ steps.get-pr-files.outputs.all_changed_files }}"
+          echo "PR中修改的文件: $CHANGED_FILES"
           
           # 如果没有修改的文件，退出
-          if [ -z "$CHANGED_FILES" ] || [ "${{ steps.get-changed-files.outputs.files_count }}" = "0" ]; then
-            echo "❌ 没有修改的文件"
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "❌ PR中没有修改的文件"
             echo "files_count=0" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # 过滤出需要格式化的源文件
+          # 将逗号分隔的文件列表转换为换行分隔
+          CHANGED_FILES=$(echo "$CHANGED_FILES" | tr ',' '\n')
+          
+          # 过滤出需要格式化的源文件（扩展clang-format支持的文件类型）
           FILES=""
-          IFS=',' read -ra FILE_ARRAY <<< "$CHANGED_FILES"
+          IFS=$'\n' read -d '' -ra FILE_ARRAY <<< "$CHANGED_FILES"
           for file in "${FILE_ARRAY[@]}"; do
-            # 去除前后空格
-            file=$(echo "$file" | xargs)
-            if [ -n "$file" ] && [[ "$file" =~ \.(cpp|h|c|hpp|cc|hh|C|H|cp|cxx|hxx|inc|inl|ipp|tpp|txx)$ ]]; then
-              # 检查文件是否存在
-              if [ -f "$file" ]; then
-                FILES="$FILES$file"$'\n'
-              else
-                echo "⚠️  文件不存在，跳过: $file"
-              fi
+            if [[ "$file" =~ \.(cpp|h|c|hpp|cc|hh|C|H|cp|cxx|hxx|inc|inl|ipp|tpp|txx)$ ]]; then
+              FILES="$FILES$file"$'\n'
             fi
           done
           
@@ -138,26 +120,20 @@ jobs:
           EXCLUDE_PATTERNS="${{ github.event.inputs.exclude_patterns }}"
           if [ -n "$EXCLUDE_PATTERNS" ] && [ -n "$FILES" ]; then
             IFS=',' read -ra PATTERNS <<< "$EXCLUDE_PATTERNS"
-            TEMP_FILE=$(mktemp)
-            echo "$FILES" > "$TEMP_FILE"
-            
             for pattern in "${PATTERNS[@]}"; do
-              pattern=$(echo "$pattern" | xargs)
+              pattern=$(echo "$pattern" | xargs)  # 去除空格
               if [ -n "$pattern" ]; then
+                # 去除末尾的斜杠（如果有）
                 pattern=${pattern%/}
                 echo "排除模式: $pattern"
-                # 使用grep过滤，保留不匹配的文件
-                grep -v "$pattern" "$TEMP_FILE" > "${TEMP_FILE}.filtered"
-                mv "${TEMP_FILE}.filtered" "$TEMP_FILE"
+                # 使用 grep 过滤排除模式
+                FILES=$(echo "$FILES" | grep -v "$pattern" || echo "$FILES")
               fi
             done
-            
-            FILES=$(cat "$TEMP_FILE")
-            rm "$TEMP_FILE"
           fi
           
           if [ -z "$FILES" ]; then
-            echo "❌ 没有需要格式化的文件（可能都被排除了或不是源文件）"
+            echo "❌ 没有需要格式化的文件（可能都被排除了）"
             echo "files_count=0" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -174,44 +150,30 @@ jobs:
           echo "files_list<<EOF" >> $GITHUB_OUTPUT
           echo "$FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-
       - name: Format code with clang-format
         if: steps.find-files.outputs.files_count != '0'
         run: |
           echo "开始格式化代码..."
           FILES="${{ steps.find-files.outputs.files_list }}"
           
-          # 创建格式化脚本
-          cat > format_files.sh << 'EOF'
-          #!/bin/bash
-          files="$1"
-          error_count=0
-          
-          while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
+          # 使用clang-format批量格式化文件
+          echo "$FILES" | xargs -I {} sh -c '
+            file="{}"
+            if [ -f "$file" ]; then
               echo "📝 格式化: $file"
-              if clang-format -style=file -i "$file"; then
+              clang-format -style=file -i "$file"
+              if [ $? -eq 0 ]; then
                 echo "✅ 格式化成功: $file"
               else
                 echo "❌ 格式化失败: $file"
-                ((error_count++))
+                exit 1
               fi
+            else
+              echo "⚠️  文件不存在: $file"
             fi
-          done <<< "$files"
+          '
           
-          exit $error_count
-          EOF
-          
-          chmod +x format_files.sh
-          
-          # 执行格式化
-          if ./format_files.sh "$FILES"; then
-            echo "✅ 所有文件格式化成功"
-          else
-            echo "❌ 部分文件格式化失败"
-            exit 1
-          fi
-
+          echo "✅ 代码格式化完成"
       - name: Check for changes
         id: check-changes
         run: |
@@ -222,12 +184,7 @@ jobs:
             echo "📋 检测到格式化更改:"
             git diff --name-only
             echo "has_changes=true" >> $GITHUB_OUTPUT
-            
-            # 显示具体的格式化差异
-            echo "格式化差异详情:"
-            git diff --stat
           fi
-
       - name: Commit and push changes
         if: steps.check-changes.outputs.has_changes == 'true'
         run: |
@@ -236,25 +193,14 @@ jobs:
           
           git add -A
           git commit -m "style: format code with clang-format [skip ci]"
+          git push origin HEAD:${{ github.event.inputs.branch }}
           
-          # 确定目标分支
-          TARGET_BRANCH="${{ github.event.inputs.branch || github.event.pull_request.head.ref }}"
-          echo "推送更改到分支: $TARGET_BRANCH"
-          
-          git push origin HEAD:$TARGET_BRANCH
-          
-          echo "✅ 代码格式化完成并已推送到分支 $TARGET_BRANCH"
-
+          echo "✅ 代码格式化完成并已推送到分支 ${{ github.event.inputs.branch }}"
       - name: Summary
         run: |
           echo "=== 格式化总结 ==="
-          echo "触发类型: ${{ github.event_name }}"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "PR编号: ${{ steps.extract-pr.outputs.PR_NUMBER }}"
-          fi
-          echo "分支: ${{ github.event.inputs.branch || github.event.pull_request.head.ref }}"
+          echo "分支: ${{ github.event.inputs.branch }}"
           echo "排除模式: ${{ github.event.inputs.exclude_patterns || '无' }}"
-          echo "修改文件总数: ${{ steps.get-changed-files.outputs.files_count }}"
-          echo "格式化文件数: ${{ steps.find-files.outputs.files_count }}"
+          echo "处理文件数: ${{ steps.find-files.outputs.files_count }}"
           echo "有更改: ${{ steps.check-changes.outputs.has_changes }}"
           echo "clang-format 版本: $(clang-format --version | head -1)"

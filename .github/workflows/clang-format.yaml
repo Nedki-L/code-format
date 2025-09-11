@@ -121,7 +121,22 @@ jobs:
         run: |
           # 获取PR中修改的文件
           CHANGED_FILES="${{ steps.get-pr-files.outputs.all_changed_files }}"
-          echo "PR中修改的文件: $CHANGED_FILES"
+          
+          # 将逗号分隔的文件列表转换为换行分隔
+          CHANGED_FILES_LINES=$(echo "$CHANGED_FILES" | tr ',' '\n')
+          
+          # 美化打印PR中修改的文件
+          echo "📋 PR中修改的文件列表:"
+          echo "┌───────────────────────────────────────────────────────"
+          count=1
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              echo "│ $count. $file"
+              ((count++))
+            fi
+          done <<< "$CHANGED_FILES_LINES"
+          echo "└───────────────────────────────────────────────────────"
+          echo "总共修改了 $((count-1)) 个文件"
           
           # 如果没有修改的文件，退出
           if [ -z "$CHANGED_FILES" ]; then
@@ -130,8 +145,8 @@ jobs:
             exit 0
           fi
           
-          # 将逗号分隔的文件列表转换为换行分隔
-          CHANGED_FILES=$(echo "$CHANGED_FILES" | tr ',' '\n')
+          # 继续使用CHANGED_FILES进行后续处理
+          CHANGED_FILES="$CHANGED_FILES_LINES"
           
           # 过滤出需要格式化的源文件（扩展clang-format支持的文件类型）
           FILES=""
@@ -166,8 +181,16 @@ jobs:
           fi
           
           # 显示找到的文件用于调试
-          echo "需要格式化的文件:"
-          echo "$FILES"
+          echo "🎯 需要格式化的文件:"
+          echo "┌───────────────────────────────────────────────────────"
+          count=1
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              echo "│ $count. $file"
+              ((count++))
+            fi
+          done <<< "$FILES"
+          echo "└───────────────────────────────────────────────────────"
           
           FILE_COUNT=$(echo "$FILES" | wc -l)
           echo "找到 $FILE_COUNT 个需要格式化的文件"
@@ -177,6 +200,13 @@ jobs:
           echo "files_list<<EOF" >> $GITHUB_OUTPUT
           echo "$FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Clean up temporary files
+        run: |
+          rm -f changed_files.txt
+          rm -f format_files.sh
+          echo "✅ 临时文件清理完成"
+          
       - name: Format code with clang-format
         if: steps.find-files.outputs.files_count != '0'
         run: |
@@ -201,6 +231,7 @@ jobs:
           '
           
           echo "✅ 代码格式化完成"
+          
       - name: Check for changes
         id: check-changes
         run: |
@@ -212,6 +243,7 @@ jobs:
             git diff --name-only
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
+          
       - name: Commit and push changes
         if: steps.check-changes.outputs.has_changes == 'true'
         run: |
@@ -223,6 +255,7 @@ jobs:
           git push origin HEAD:${{ github.event.inputs.branch }}
           
           echo "✅ 代码格式化完成并已推送到分支 ${{ github.event.inputs.branch }}"
+          
       - name: Summary
         run: |
           echo "=== 格式化总结 ==="
